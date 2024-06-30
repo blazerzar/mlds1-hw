@@ -1,0 +1,438 @@
+---
+title: Loss estimation
+author: Blaž Erzar
+output: pdf_document
+---
+
+In practice, many machine learning practitioners evaluate their models using
+train-test splits or cross-validation. When using these approaches, we are
+only estimating the true risk of the model. In this report, we present
+findings on how the estimated model risk compares to the true risk proxy in
+different scenarios.
+
+```{r include = FALSE}
+library(ggplot2)
+library(dplyr)
+
+toy_data <- function(n, seed = NULL) {
+  set.seed(seed)
+  x <- matrix(rnorm(8 * n), ncol = 8)
+  z <- 0.4 * x[, 1] - 0.5 * x[, 2] + 1.75 * x[, 3] - 0.2 * x[, 4] + x[, 5]
+  y <- runif(n) > 1 / (1 + exp(-z))
+  return(data.frame(x = x, y = y))
+}
+
+log_loss <- function(y, p) {
+  -(y * log(p) + (1 - y) * log(1 - p))
+}
+```
+
+# A proxy for the true risk
+
+```{r include = FALSE}
+df_dgp <- toy_data(100000, 1)
+```
+
+The model's risk converges to the true risk in probability. Because it is an
+average, it is distributed normally around the true value. Its variance drops
+with the sample size. To compute the variance of the log-loss, we train a
+model and compute the log-loss for every data instance. The standard error,
+i.e., the standard deviation of the estimator, is then the standard deviation
+of these log-losses divided by the square root of the sample size. We can see
+that the standard deviation of the log-losses is reduced to the third decimal
+digit.
+
+```{r}
+h_dgp <- glm(y ~ ., data = df_dgp, family = "binomial")
+losses <- log_loss(df_dgp$y, predict(h_dgp, df_dgp, type = "response"))
+cat(sprintf("Model's risk SE: %.4f\n", sd(losses) / sqrt(nrow(df_dgp))))
+```
+
+# Model loss estimator variability due to test data variability
+
+First, we take a look at the variability of the model's risk computed on a
+separate test set, which is generated from the same DGP as the training data.
+In practice, we usually do not have access to such test sets.
+
+```{r include = FALSE}
+data_train <- toy_data(50, 0)
+h <- glm(y ~ ., data = data_train, family = "binomial")
+
+# Compute the true model risk from the DGP
+compute_model_risk <- function(model, data, aggregate = TRUE) {
+  losses <- log_loss(
+    data$y,
+    predict(model, select(data, !"y"), type = "response")
+  )
+  if (aggregate) mean(losses) else losses
+}
+true_risk <- compute_model_risk(h, df_dgp)
+```
+
+```{r results = "hold", include = FALSE}
+standard_errors <- vector("numeric", 1000)
+ci_include <- vector("logical", 1000)
+risk_differences <- vector("numeric", 1000)
+
+# Compute CI using empirical risk and check if true risk is contained
+for (i in 1:1000) {
+  data_test <- toy_data(50, i + 1)
+  losses <- compute_model_risk(h, data_test, aggregate = FALSE)
+  est_risk <- mean(losses)
+  standard_errors[i] <- sd(losses) / sqrt(nrow(data_test))
+
+  ci <- est_risk + c(-1, 1) * 1.96 * standard_errors[i]
+  ci_include[i] <- true_risk >= ci[1] && true_risk <= ci[2]
+
+  risk_differences[i] <- est_risk - true_risk
+}
+
+baseline_50_50 <- mean(log_loss(df_dgp$y, 0.5))
+```
+
+```{r fig.width = 2, fig.height = 2, echo = FALSE}
+data.frame(risk_differences) |>
+  ggplot(aes(x = risk_differences)) +
+  geom_density() +
+  xlab(bquote(R[n] - R)) +
+  ylab("Density")
+
+cat(
+  sprintf("True risk proxy: %.4f\n", true_risk),
+  sprintf("Mean difference: %.4f\n", mean(risk_differences)),
+  sprintf("0.5-0.5 baseline true risk: %.4f\n", baseline_50_50),
+  sprintf("Median standard error: %.4f\n", median(standard_errors)),
+  sprintf(
+    "Percentage of 95CI that contain the true risk proxy: %.1f%%\n",
+    100 * mean(ci_include)
+  ), sep = ""
+)
+```
+
+Since the baseline true risk is higher than the model's true risk, the model
+successfully learned patterns from the data.
+
+As expected by the convergence of the model's risk to the true risk, the
+difference is distributed with a mean close to zero. This means that the
+risk estimate using a test set is unbiased and a sensible estimate in practice
+if we have access to a test set from our DGP.
+
+It can be seen from the standard error, that there is some variability in the
+estimate of the risk. This is expected because a smaller test set with 50
+instances will not have the same distribution as the DGP. Since the estimate
+has some uncertainty, it should be reported in practice.
+
+We also observe that the true risk is contained less than 95% of the time,
+meaning the standard error is slightly underestimated.
+
+With a bigger train set, the true risk, as well as the estimate, would probably
+decrease, because the model would have more data to learn from. A bigger train
+set would probably also decrease the variance of the estimate because all
+such sets would be more representative of the DGP. If the train set was too
+small, the model would not be able to learn anything and could perform even
+worse than the baseline.
+
+With a bigger test set, the variance of the difference would be smaller,
+because the test set would be more representative of the DGP. Similarly, for a
+smaller test set, the variance would be bigger.
+
+# Overestimation of the deployed model's risk
+
+In practice, we usually deploy models that are trained on a dataset that is
+larger than the train set used to estimate the model's performance. Here, we
+compare the true risk of two models, $h_1$ trained on 50 observations and $h_2$
+trained on an additional 50 observations. Both train sets have 50 observations
+in common.
+
+```{r warning = FALSE, include = FALSE}
+risk_differences <- vector("numeric", 50)
+
+for (i in 1:50) {
+  toy_1 <- toy_data(50, 2 * i)
+  toy_2 <- toy_data(50, 2 * i + 1)
+  models <- lapply(list(toy_1, rbind(toy_1, toy_2)), function(data) {
+    glm(y ~ ., data = data, family = "binomial")
+  })
+  risks <- sapply(models, function(h) compute_model_risk(h, df_dgp))
+  risk_differences[i] <- risks[1] - risks[2]
+}
+```
+
+```{r echo = FALSE}
+cat("Summary of true risk h1 - true risk h2:\n")
+summary(risk_differences)
+```
+
+As expected, the model trained on a larger dataset performs better in general.
+The risk of $h_2$ is usually lower than the risk of $h_1$, meaning their
+difference is positive.
+
+In practice, we should keep in mind that the risk estimation is computed on a
+different model than the one that is deployed. After deployment, we could
+additionally evaluate the model on a separate test set, perhaps even in
+parallel with the already deployed model, if it exists.
+
+If the train sets were smaller, the difference would probably be even bigger,
+because each additional observation would have a larger impact. This is
+especially true because the models might not converge with such a small train
+set.
+
+If the train sets were bigger, the difference would be smaller, because the
+smaller train set for $h_1$ would already be representative of the DGP and
+additional observations would not have a big impact.
+
+# Loss estimator variability due to split variability
+
+Most commonly, we do not have access to an additional test set from the DGP,
+so we split the data into train and test sets.
+
+```{r results = "hold", warning = FALSE, include = FALSE}
+data <- toy_data(100, 0)
+h_0 <- glm(y ~ ., data = data, family = "binomial")
+true_risk <- compute_model_risk(h_0, df_dgp)
+
+standard_errors <- vector("numeric", 1000)
+ci_include <- vector("logical", 1000)
+risk_differences <- vector("numeric", 1000)
+
+for (i in 1:1000) {
+  train_indices <- sample(nrow(data), nrow(data) / 2)
+  train <- data[train_indices, ]
+  test <- data[-train_indices, ]
+  h <- glm(y ~ ., data = train, family = "binomial")
+
+  losses <- compute_model_risk(h, test, aggregate = FALSE)
+  est_risk <- mean(losses)
+  standard_errors[i] <- sd(losses) / sqrt(nrow(test))
+
+  ci <- est_risk + c(-1, 1) * 1.96 * standard_errors[i]
+  ci_include[i] <- true_risk >= ci[1] && true_risk <= ci[2]
+
+  risk_differences[i] <- est_risk - true_risk
+}
+```
+
+```{r fig.width = 2, fig.height = 1.8, echo = FALSE}
+data.frame(risk_differences) |>
+  ggplot(aes(x = risk_differences)) +
+  geom_density() +
+  xlab(bquote(R[n] - R)) +
+  ylab("Density")
+
+cat(
+  sprintf("True risk proxy: %.4f\n", true_risk),
+  sprintf("Mean difference: %.4f\n", mean(risk_differences)),
+  sprintf("Median standard error: %.4f\n", median(standard_errors)),
+  sprintf(
+    "Percentage of 95CI that contain the true risk proxy: %.1f%%\n",
+    100 * mean(ci_include)
+  ), sep = ""
+)
+```
+
+As expected, this estimate is highly biased. More accurately, it is positively
+biased and pessimistic. This means that the estimated risk is higher than the
+true risk. Also, the standard error is slightly higher than the standard error
+of separate test set estimates, but this error is even more underestimated.
+This can be seen from the coverage of the 95% confidence interval, which is
+much lower here. In each split, we get a variability of the model performance
+due to different train sets and a variability of the estimate due to different
+test sets.
+
+There are also instances, where the estimated risk is much higher than the true
+risk. This is visible from the long right tail of the density plot. This
+probably occurs when the train set is not representative of the DGP, and the
+model cannot properly learn and performs much worse.
+
+For practical purposes, we should note that train-test split estimation is
+highly biased, especially for small datasets, where a smaller train set causes
+a large decrease in the model's performance. Even if we report the uncertainty,
+it will usually be underestimated.
+
+If the dataset was larger, the bias would probably be smaller, because the
+train set would be more representative of the DGP and the difference with the
+original train set would be smaller. The estimate would still have some
+variance, but it would be smaller if the dataset was large enough for its
+splits to be representative. Both the estimated and the true risk would be
+lower because the model would have more data to learn from.
+
+If the proportion of the train set was bigger, the model would perform better
+and more similarly to the model trained on the whole dataset. This means that
+the bias would be smaller, but because the test set would be smaller, the
+variance would increase. On the other hand, a smaller proportion of the train
+set would increase the bias, but decrease the variance.
+
+# Cross-validation
+
+Instead of train-test split, cross-validation is used many times. We compare
+cross-validation with a different number of folds and repetitions, while also
+drawing a new dataset from the DGP in each iteration.
+
+```{r include = FALSE}
+cv_estimate <- function(data, folds, repeats = 1, seed = NULL) {
+  set.seed(seed)
+  losses <- matrix(NA, nrow = repeats, ncol = nrow(data))
+
+  for (i in 1:repeats) {
+    # Create folds
+    folds_mask <- sample(rep(1:folds, each = nrow(data) / folds))
+
+    for (j in 1:folds) {
+      test_mask <- folds_mask == j
+      train <- data[folds_mask != j, ]
+      test <- data[test_mask, ]
+
+      # Train on all other folds, test on the current fold
+      h <- glm(y ~ ., data = train, family = "binomial")
+      losses[i, test_mask] <- compute_model_risk(h, test, aggregate = FALSE)
+    }
+  }
+
+  return(colMeans(losses))
+}
+```
+
+```{r cache = TRUE, warning = FALSE, include = FALSE}
+folds_repeats <- matrix(c(2, 4, 10, 10, 100, 1, 1, 1, 20, 1), nrow = 5)
+cv_names <- c("2-fold", "4-fold", "10-fold", "10-fold-20-rep", "loocv")
+
+standard_errors <- matrix(NA, nrow = 5, ncol = 500)
+ci_include <- matrix(NA, nrow = 5, ncol = 500)
+risk_differences <- matrix(NA, nrow = 5, ncol = 500)
+
+for (i in 1:500) {
+  data <- toy_data(100, i + 1)
+  h_0 <- glm(y ~ ., data = data, family = "binomial")
+  true_risk <- compute_model_risk(h_0, df_dgp)
+
+  for (experiment in 1:5) {
+    # Compute CV estimate
+    folds <- folds_repeats[experiment, 1]
+    repeats <- folds_repeats[experiment, 2]
+    losses <- cv_estimate(data, folds, repeats, seed = i)
+
+    est_risk <- mean(losses)
+    standard_errors[experiment, i] <- sd(losses) / sqrt(nrow(data))
+
+    ci <- est_risk + c(-1, 1) * 1.96 * standard_errors[experiment, i]
+    ci_include[experiment, i] <- true_risk >= ci[1] && true_risk <= ci[2]
+
+    risk_differences[experiment, i] <- est_risk - true_risk
+  }
+}
+```
+
+```{r results = "hold", fig.height = 3.8, echo = FALSE}
+data.frame(
+  risk_differences = c(t(risk_differences)),
+  method = rep(cv_names, each = 500)
+) |>
+  ggplot(aes(x = risk_differences)) +
+  geom_density() +
+  facet_wrap(~ factor(method, cv_names), ncol = 4) +
+  xlab(bquote(R[n] - R)) +
+  ylab("Density")
+```
+
+We can observe that increasing the number of folds decreases the bias of the
+estimate. This is expected because the train set is getting bigger and more
+similar to the original dataset. This also means that the variance gets smaller
+with the number of folds because the model performance is more stable. However,
+drawing a new dataset in each iteration has caused the uncertainty to be more
+underestimated when compared to the previous task.
+
+The smallest bias is achieved with the leave-one-out cross-validation, while
+10-fold, 10-fold with 20 repetitions and LOO have similar variances. Out of
+these, 10-fold cross-validation with 20 repetitions underestimated the
+uncertainty the least.
+
+From these results, we can conclude that using 2-fold cross-validation is
+not the best option in practice. Usually, LOO performs the best, but we can
+achieve similar results with 10-fold cross-validation with 20 repetitions and
+save a lot of computational time.
+
+```{r results = "hold", echo = FALSE}
+for (i in 1:5) {
+  cat(
+    cv_names[i], ":\n",
+    sprintf("  Mean difference: %.4f\n", mean(risk_differences[i, ])),
+    sprintf("  Median standard error: %.4f\n", median(standard_errors[i, ])),
+    sprintf(
+      "  Percentage of 95CI that contain the true risk proxy: %.1f%%\n",
+      100 * mean(ci_include[i, ])
+    ), sep = ""
+  )
+}
+```
+
+\newpage
+
+# A different scenario
+
+Increasing the size of the dataset from 100 to 1000, we can observe that the
+results are much different from the previous task. All methods perform very
+similarly, there being negligible differences between 10-fold, 10-fold with 20
+repetitions and LOO. The 2-fold and 4-fold cross-validations perform only
+slightly worse, which might not even be significant.
+
+The reason for this is the fact that the dataset is much bigger. Even the
+folds in the 2-fold cross-validation that had a high variance before, are now
+more representative of the DGP than the whole previous dataset was. We can also
+observe that this is the only task where the uncertainty is not underestimated,
+in some cases even being slightly overestimated.
+
+```{r cache = TRUE, warning = FALSE, include = FALSE}
+folds_repeats <- matrix(c(2, 4, 10, 10, 100, 1, 1, 1, 20, 1), nrow = 5)
+cv_names <- c("2-fold", "4-fold", "10-fold", "10-fold-20-rep", "loocv")
+
+standard_errors <- matrix(NA, nrow = 5, ncol = 500)
+ci_include <- matrix(NA, nrow = 5, ncol = 500)
+risk_differences <- matrix(NA, nrow = 5, ncol = 500)
+
+for (i in 1:500) {
+  data <- toy_data(1000, i + 1)
+  h_0 <- glm(y ~ ., data = data, family = "binomial")
+  true_risk <- compute_model_risk(h_0, df_dgp)
+
+  for (experiment in 1:5) {
+    # Compute CV estimate
+    folds <- folds_repeats[experiment, 1]
+    repeats <- folds_repeats[experiment, 2]
+    losses <- cv_estimate(data, folds, repeats, seed = i)
+
+    est_risk <- mean(losses)
+    standard_errors[experiment, i] <- sd(losses) / sqrt(nrow(data))
+
+    ci <- est_risk + c(-1, 1) * 1.96 * standard_errors[experiment, i]
+    ci_include[experiment, i] <- true_risk >= ci[1] && true_risk <= ci[2]
+
+    risk_differences[experiment, i] <- est_risk - true_risk
+  }
+}
+```
+
+```{r results = "hold", fig.height = 3.8, echo = FALSE}
+data.frame(
+  risk_differences = c(t(risk_differences)),
+  method = rep(cv_names, each = 500)
+) |>
+  ggplot(aes(x = risk_differences)) +
+  geom_density() +
+  facet_wrap(~ factor(method, cv_names), ncol = 4) +
+  xlab(bquote(R[n] - R)) +
+  ylab("Density")
+```
+
+```{r results = "hold", echo = FALSE}
+for (i in 1:5) {
+  cat(
+    cv_names[i], ":\n",
+    sprintf("  Mean difference: %.4f\n", mean(risk_differences[i, ])),
+    sprintf("  Median standard error: %.4f\n", median(standard_errors[i, ])),
+    sprintf(
+      "  Percentage of 95CI that contain the true risk proxy: %.1f%%\n",
+      100 * mean(ci_include[i, ])
+    ), sep = ""
+  )
+}
+```

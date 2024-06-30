@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+.vscode/
+homework_2/homework_cache/
+homework_2/homework_files/
+*.csv
+*.json
+*.gz
+*.txt
